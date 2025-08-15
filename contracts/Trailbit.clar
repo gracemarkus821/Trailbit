@@ -10,6 +10,11 @@
 (define-constant err-already-rated (err u108))
 (define-constant err-review-too-long (err u109))
 (define-constant err-cannot-rate-own-trail (err u110))
+(define-constant err-invalid-condition-type (err u111))
+(define-constant err-condition-already-reported (err u112))
+(define-constant err-condition-expired (err u113))
+(define-constant err-cannot-verify-own-report (err u114))
+(define-constant err-condition-not-found (err u115))
 
 (define-fungible-token trailbit)
 
@@ -108,6 +113,66 @@
 (define-data-var quality-threshold uint u4)
 (define-data-var bonus-multiplier uint u150)
 
+;; Trail condition reporting constants
+(define-constant condition-clear u1)
+(define-constant condition-muddy u2)
+(define-constant condition-icy u3)
+(define-constant condition-blocked u4)
+(define-constant condition-flooded u5)
+(define-constant condition-unsafe u6)
+(define-constant condition-snow u7)
+(define-constant condition-maintenance u8)
+
+;; Trail condition maps
+(define-map trail-current-conditions
+  { trail-id: uint }
+  {
+    condition-type: uint,
+    severity: uint,
+    last-updated: uint,
+    reporter-count: uint,
+    verified: bool,
+    expires-at: uint
+  }
+)
+
+(define-map condition-reports
+  { trail-id: uint, reporter: principal, report-id: uint }
+  {
+    condition-type: uint,
+    severity: uint,
+    description: (string-ascii 128),
+    timestamp: uint,
+    verified-by: uint,
+    reward-earned: uint
+  }
+)
+
+(define-map condition-verifications
+  { trail-id: uint, report-id: uint, verifier: principal }
+  {
+    verified: bool,
+    timestamp: uint
+  }
+)
+
+(define-map user-condition-stats
+  { user: principal }
+  {
+    reports-submitted: uint,
+    reports-verified: uint,
+    verifications-performed: uint,
+    condition-rewards-earned: uint,
+    accuracy-score: uint
+  }
+)
+
+(define-data-var condition-report-reward uint u10000)
+(define-data-var condition-verification-reward uint u5000)
+(define-data-var condition-expiry-blocks uint u1440)
+(define-data-var next-report-id uint u1)
+(define-data-var min-verifications uint u2)
+
 (define-public (create-trail (name (string-ascii 64)) (location (string-ascii 128)) (difficulty uint) (reward-pool uint) (discovery-reward uint) (maintenance-reward uint))
   (let
     (
@@ -164,7 +229,9 @@
       (visitor-data (default-to { visit-count: u0, last-visit: u0, total-earned: u0 } (map-get? trail-visits { trail-id: trail-id, visitor: tx-sender })))
       (base-reward (get discovery-reward trail))
       (quality-multiplier (if (>= (get average-rating trail) (var-get quality-threshold)) (var-get bonus-multiplier) u100))
-      (reward-amount (/ (* base-reward quality-multiplier) u100))
+      (safety-multiplier (get-condition-safety-multiplier trail-id))
+      (combined-multiplier (/ (* quality-multiplier safety-multiplier) u100))
+      (reward-amount (/ (* base-reward combined-multiplier) u100))
     )
     (asserts! (get active trail) err-trail-inactive)
     (asserts! (>= (get reward-pool trail) reward-amount) err-insufficient-funds)
@@ -440,6 +507,181 @@
   )
 )
 
+;; Trail condition reporting functions
+(define-public (report-trail-condition (trail-id uint) (condition-type uint) (severity uint) (description (string-ascii 128)))
+  (let
+    (
+      (trail (unwrap! (map-get? trails { trail-id: trail-id }) err-not-found))
+      (current-block stacks-block-height)
+      (report-id (var-get next-report-id))
+      (existing-condition (map-get? trail-current-conditions { trail-id: trail-id }))
+      (user-condition-data (default-to { reports-submitted: u0, reports-verified: u0, verifications-performed: u0, condition-rewards-earned: u0, accuracy-score: u100 } (map-get? user-condition-stats { user: tx-sender })))
+      (expires-at (+ current-block (var-get condition-expiry-blocks)))
+    )
+    ;; Validate inputs
+    (asserts! (get active trail) err-trail-inactive)
+    (asserts! (and (>= condition-type condition-clear) (<= condition-type condition-maintenance)) err-invalid-condition-type)
+    (asserts! (and (>= severity u1) (<= severity u5)) err-invalid-amount)
+    (asserts! (<= (len description) u128) err-review-too-long)
+    
+    ;; Check if condition is already reported recently
+    (match existing-condition
+      condition-data
+        (asserts! (> (- current-block (get last-updated condition-data)) u144) err-condition-already-reported)
+      true
+    )
+    
+    ;; Create condition report
+    (map-set condition-reports
+      { trail-id: trail-id, reporter: tx-sender, report-id: report-id }
+      {
+        condition-type: condition-type,
+        severity: severity,
+        description: description,
+        timestamp: current-block,
+        verified-by: u0,
+        reward-earned: u0
+      }
+    )
+    
+    ;; Update or create current trail condition
+    (map-set trail-current-conditions
+      { trail-id: trail-id }
+      {
+        condition-type: condition-type,
+        severity: severity,
+        last-updated: current-block,
+        reporter-count: u1,
+        verified: false,
+        expires-at: expires-at
+      }
+    )
+    
+    ;; Update user stats
+    (map-set user-condition-stats
+      { user: tx-sender }
+      (merge user-condition-data {
+        reports-submitted: (+ (get reports-submitted user-condition-data) u1)
+      })
+    )
+    
+    ;; Award initial reporting reward
+    (try! (as-contract (ft-transfer? trailbit (var-get condition-report-reward) tx-sender tx-sender)))
+    
+    (var-set next-report-id (+ report-id u1))
+    (ok report-id)
+  )
+)
+
+(define-public (verify-condition-report (trail-id uint) (reporter principal) (report-id uint) (agrees bool))
+  (let
+    (
+      (current-block stacks-block-height)
+      (report-data (unwrap! (map-get? condition-reports { trail-id: trail-id, reporter: reporter, report-id: report-id }) err-not-found))
+      (condition-data (unwrap! (map-get? trail-current-conditions { trail-id: trail-id }) err-condition-not-found))
+      (existing-verification (map-get? condition-verifications { trail-id: trail-id, report-id: report-id, verifier: tx-sender }))
+      (user-verification-data (default-to { reports-submitted: u0, reports-verified: u0, verifications-performed: u0, condition-rewards-earned: u0, accuracy-score: u100 } (map-get? user-condition-stats { user: tx-sender })))
+    )
+    ;; Validate verification
+    (asserts! (is-none existing-verification) err-already-exists)
+    (asserts! (not (is-eq tx-sender reporter)) err-cannot-verify-own-report)
+    (asserts! (< (get timestamp report-data) current-block) err-condition-expired)
+    (asserts! (< current-block (get expires-at condition-data)) err-condition-expired)
+    
+    ;; Create verification record
+    (map-set condition-verifications
+      { trail-id: trail-id, report-id: report-id, verifier: tx-sender }
+      {
+        verified: agrees,
+        timestamp: current-block
+      }
+    )
+    
+    ;; Update user verification stats
+    (map-set user-condition-stats
+      { user: tx-sender }
+      (merge user-verification-data {
+        verifications-performed: (+ (get verifications-performed user-verification-data) u1)
+      })
+    )
+    
+    ;; Award verification reward
+    (try! (as-contract (ft-transfer? trailbit (var-get condition-verification-reward) tx-sender tx-sender)))
+    
+    ;; Check if enough verifications to mark as verified
+    (let
+      (
+        (verification-count (+ (get verified-by report-data) (if agrees u1 u0)))
+      )
+      (if (>= verification-count (var-get min-verifications))
+        (begin
+          (map-set trail-current-conditions
+            { trail-id: trail-id }
+            (merge condition-data { verified: true })
+          )
+          (map-set condition-reports
+            { trail-id: trail-id, reporter: reporter, report-id: report-id }
+            (merge report-data { verified-by: verification-count })
+          )
+        )
+        (map-set condition-reports
+          { trail-id: trail-id, reporter: reporter, report-id: report-id }
+          (merge report-data { verified-by: verification-count })
+        )
+      )
+    )
+    
+    (ok agrees)
+  )
+)
+
+(define-public (clear-expired-conditions (trail-id uint))
+  (let
+    (
+      (current-block stacks-block-height)
+      (condition-data (map-get? trail-current-conditions { trail-id: trail-id }))
+    )
+    (match condition-data
+      data
+        (if (>= current-block (get expires-at data))
+          (begin
+            (map-delete trail-current-conditions { trail-id: trail-id })
+            (ok true)
+          )
+          err-condition-not-found
+        )
+      err-condition-not-found
+    )
+  )
+)
+
+;; Helper function to calculate condition impact on rewards
+(define-private (get-condition-safety-multiplier (trail-id uint))
+  (let
+    (
+      (condition-data (map-get? trail-current-conditions { trail-id: trail-id }))
+      (current-block stacks-block-height)
+    )
+    (match condition-data
+      data
+        (if (< current-block (get expires-at data))
+          (if (get verified data)
+            (if (or (is-eq (get condition-type data) condition-unsafe) (is-eq (get condition-type data) condition-blocked))
+              u0  ;; No rewards for unsafe/blocked trails
+              (if (or (is-eq (get condition-type data) condition-muddy) (is-eq (get condition-type data) condition-icy))
+                u75  ;; 25% penalty for challenging conditions
+                u100  ;; Normal rewards for clear/snow/maintenance
+              )
+            )
+            u90  ;; 10% penalty for unverified conditions
+          )
+          u100  ;; Normal rewards if no current conditions
+        )
+      u100  ;; Normal rewards if no condition data
+    )
+  )
+)
+
 (define-public (mint (amount uint) (recipient principal))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -541,4 +783,46 @@
   }
 )
 
+;; Condition reporting read-only functions
+(define-read-only (get-trail-current-condition (trail-id uint))
+  (map-get? trail-current-conditions { trail-id: trail-id })
+)
+
+(define-read-only (get-condition-report (trail-id uint) (reporter principal) (report-id uint))
+  (map-get? condition-reports { trail-id: trail-id, reporter: reporter, report-id: report-id })
+)
+
+(define-read-only (get-condition-verification (trail-id uint) (report-id uint) (verifier principal))
+  (map-get? condition-verifications { trail-id: trail-id, report-id: report-id, verifier: verifier })
+)
+
+(define-read-only (get-user-condition-stats (user principal))
+  (map-get? user-condition-stats { user: user })
+)
+
+(define-read-only (get-condition-settings)
+  {
+    report-reward: (var-get condition-report-reward),
+    verification-reward: (var-get condition-verification-reward),
+    expiry-blocks: (var-get condition-expiry-blocks),
+    min-verifications: (var-get min-verifications),
+    next-report-id: (var-get next-report-id)
+  }
+)
+
+(define-read-only (get-condition-types)
+  {
+    clear: condition-clear,
+    muddy: condition-muddy,
+    icy: condition-icy,
+    blocked: condition-blocked,
+    flooded: condition-flooded,
+    unsafe: condition-unsafe,
+    snow: condition-snow,
+    maintenance: condition-maintenance
+  }
+)
+
 (mint u1000000000000 contract-owner)
+
+
